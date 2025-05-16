@@ -1,24 +1,26 @@
 # Lưu ý: tính light intensity từ độ che phủ mây
-# Độ che phủ mây (%)	Mô tả thời tiết	Ước lượng ánh sáng (lux)
-# 0–10%	    Trời nắng gắt	    ~100,000 lux
-# 10–30%	Nắng đẹp	        ~60,000–80,000 lux
-# 30–60%	Nắng dịu, có mây	~20,000–50,000 lux
-# 60–90%	Mây nhiều, ít nắng	~10,000–20,000 lux
-# 90–100%	U ám, mưa	        ~1,000–10,000 lux
+# Độ che phủ mây (%)	Mô tả thời tiết	    Ước lượng ánh sáng (lux)
+# 0–10%	                Trời nắng gắt	    ~100,000 lux
+# 10–30%	            Nắng đẹp	        ~60,000–80,000 lux
+# 30–60%	            Nắng dịu, có mây	~20,000–50,000 lux
+# 60–90%	            Mây nhiều, ít nắng	~10,000–20,000 lux
+# 90–100%	            U ám, mưa	        ~1,000–10,000 lux
 # => nội suy đơn giản
 # lux = int(100000 * (1 - cloudiness / 100))
 
 from flask import Flask, request, jsonify
 import joblib
-import numpy as np
 import pandas as pd
 import requests
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+from datetime import timedelta
 from sklearn.preprocessing import StandardScaler
 from dotenv import load_dotenv
 from keras.models import load_model
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
@@ -31,18 +33,20 @@ app = Flask(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
+     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.FileHandler("server.log"),
-        logging.StreamHandler()  # Ghi ra console (giúp xem dễ trên Render)
-    ]
+        logging.StreamHandler()
+    ],
 )
+logging.Formatter.converter = lambda *args: time.gmtime(time.time() + 7*3600)
 
 model = load_model("deep_model.keras")
 scaler = joblib.load("scaler.pkl")
 y_scaler = joblib.load("y_scaler.pkl")
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY") # or "YOUR_API_KEY_HERE"
-DEFAULT_LOCATION = {"lat": 10.762622, "lon": 106.660172}  # TP.HCM
+DEFAULT_LOCATION = {"lat": 10.762622, "lon": 106.660172}  # TP.HCM, VietNam
 
 @app.route("/predict", methods=["POST"])
 def predict():
@@ -64,6 +68,10 @@ def predict():
         logging.info(f"📥 Nhận từ ESP32: temp={temperature}, soil={soil_moisture}, water={water_level}, humidity={humidity_air}, last_watered_hour={last_watered_hour}")
 
         weather_data = get_weather_data()
+        if isinstance(weather_data, str) and weather_data == "-1":
+            logging.warning("⚠️ Dự báo thời tiết không khả dụng. Trả về -1ml.")
+            return str(-1)
+
         logging.info(f"🌤 Dữ liệu thời tiết: {weather_data}")
 
         full_data = {
@@ -94,7 +102,7 @@ def predict():
         Trả về kết quả cho ESP32
         """
         # Đảm bảo đúng thứ tự cột
-        X_input = pd.DataFrame([full_data])
+        X_input = pd.DataFrame([full_data])[feature_order]
         X_input.fillna(0, inplace=True)
 
         # Chuẩn hóa đầu vào
@@ -106,23 +114,31 @@ def predict():
         # Giải chuẩn hóa đầu ra
         predicted_ml = y_scaler.inverse_transform(prediction.reshape(-1, 1))
         result = float(predicted_ml[0][0])
+        rounded_result = abs(int(round(result)))  # Làm tròn và lấy trị tuyệt đối
 
-        logging.info(f"✅ Dự đoán: {result:.2f} ml nước")
-        print(f"✅ Dự đoán: {result:.2f} ml nước")
+        
+        logging.info(f"✅ Dự đoán: {rounded_result} ml nước")
+        print(f"✅ Dự đoán: {rounded_result} ml nước")
 
-        return jsonify(result)
+        return jsonify(rounded_result)
 
     except Exception as e:
         print("❌ Lỗi server:", e)
+        logging.error(f"❌ Lỗi server: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
 
 def get_weather_data():
     try:
+        # Retry API 3 lần nếu gặp lỗi
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.5)
+        session.mount('http://', HTTPAdapter(max_retries=retries))
+
         url = f"http://api.openweathermap.org/data/2.5/weather?lat={DEFAULT_LOCATION['lat']}&lon={DEFAULT_LOCATION['lon']}&appid={OPENWEATHER_API_KEY}&units=metric"
-        response = requests.get(url)
+        response = requests.get(url, timeout=5)
+        
         if response.status_code != 200:
-            raise Exception("Không gọi được OpenWeather")
+            raise Exception(f"Mã lỗi {response.status_code}: {response.text}")
 
         data = response.json()
         cloudiness = data.get("clouds", {}).get("all", 50)
@@ -135,18 +151,20 @@ def get_weather_data():
         }
 
     except Exception as e:
-        logging.warning(f"⚠️ Không lấy được dữ liệu thời tiết: {e}")
-        print("⚠️ Không lấy được dữ liệu thời tiết:", e)
-        print("Vì không thể connect được API OpenWeather, ta giả định trời có mây, không mưa và lấy thời gian được lưu trên mạch làm chuẩn.")
-        return {
-            "light_intensity": 20000, # giả định có mây
-            "time_of_day": get_time_of_day(),
-            "rain_prediction": 0
-        }
+        logging.error(f"❌ Không lấy được dữ liệu thời tiết, trả về -1ml, lỗi: {e}")
+        blynk_notify("⚠️ Không lấy được thời tiết! Vui lòng kiểm tra.")
+        return str(-1)
+
+def blynk_notify(message):
+    url = f"https://blynk.cloud/external/api/notify?token={BLYNK_AUTH_TOKEN}&message={message}"
+    response = requests.get(url, timeout=5)
+    if response.status_code != 200:
+        raise Exception(f"Blynk notify failed: {response.status_code}")
 
 def get_time_of_day():
-    now = datetime.utcnow().hour + 7  # giờ VN
-    return now % 24
+    now_utc = datetime.utcnow()
+    now_vn = now_utc + timedelta(hours=7)
+    return now_vn.hour
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)
